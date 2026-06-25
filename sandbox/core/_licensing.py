@@ -113,7 +113,8 @@ def set_elementor_primary(instance: str, url: str) -> None:
 
 
 def license_status() -> dict:
-    """Presence + masked hints + primary, for `sb license status`. No raw keys."""
+    """Presence + masked hints + primary, for `sb license status`. No raw keys.
+    """
     return {
         "elementor": _mask(get_license("elementor")),
         "elementor_primary": elementor_primary(),
