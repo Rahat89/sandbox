@@ -8,6 +8,12 @@
 
 **Input**: "$ARGUMENTS"
 
+**Drafting Model**: `gpt-5.6-terra` Medium (or actual fallback)
+
+**Final Validation**: `PENDING` — `gpt-5.6-sol` High
+
+**Validated On**: [DATE or N/A]
+
 **Artifact Owner**: `speckit-refine`
 
 **Next Stage**: `speckit-specify`
@@ -77,6 +83,7 @@
 - [ ] Acceptance outcomes are measurable and implementation-independent.
 - [ ] No blocking open questions remain.
 - [ ] No implementation plan, task list, contracts, or code changes are included.
+- [ ] The latest independent Sol High validation verdict is `PASS`.
 
 **Readiness**: `NOT READY`
 
