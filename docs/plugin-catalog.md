@@ -1,6 +1,6 @@
-# WPDeveloper plugin catalog (reference)
+# Plugin catalog (reference)
 
-A reference list of WPDeveloper plugins, their WP slugs, GitHub repos, and
+A reference list of plugins, their WP slugs, GitHub repos, and
 free/Pro split. **This is documentation, not config.** The live instance model is
 per-project — each plugin checkout self-describes via its own
 `sandbox.config.json` (constitution Principle I). This catalog exists so per-plugin
@@ -38,10 +38,6 @@ GitHub org: `WPDevelopers`. Repos default to `WPDevelopers/<slug>` unless the
 | | `disable-feeds` | `disable-feeds` | Free |
 | **XSpeed** | `xspeed` | `xspeed` | Free |
 | | `xspeed-pro` | `xspeed-pro` | Pro |
-
-The Sandbox WPDeveloper keyless activation loader includes the exact
-`xspeed-pro` Pro slug in its scoped allowlist. The free `xspeed` slug is not
-matched, so activation does not broaden to unrelated or free plugins.
 
 Other known slug↔repo mismatches from the old catalog/notes (verify before use):
 `wowstore` repo → **`productx`** slug.
