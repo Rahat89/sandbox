@@ -24,6 +24,7 @@ _FENCE = re.compile(r"^\s{0,3}(```|~~~)")
 _HTML_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 _HTML_H1 = re.compile(r"<h1[^>]*>(.*?)</h1>", re.I | re.S)
 _TAGS = re.compile(r"<[^>]+>")
+IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9-]{0,119}")
 
 
 def ttl_hours(value: str) -> int:
@@ -128,7 +129,7 @@ class NotesClient:
     # -- notes --------------------------------------------------------------
 
     def create(self, path: Path, *, title: str | None = None, html: bool = False,
-               public: bool = False) -> dict:
+               public: bool = False, collection: str | None = None) -> dict:
         text = read_text(path)
         arguments = {"title": title or title_for(path, text, html=html), "content": text,
                      "filename": Path(path).stem}
@@ -136,6 +137,8 @@ class NotesClient:
             arguments["format"] = "html"
         if public:
             arguments["visibility"] = "public"
+        if collection is not None:
+            arguments["collection"] = collection
         return self.one("create_note", **arguments)
 
     def update(self, slug: str, path: Path, *, title: str | None = None) -> dict:
@@ -147,11 +150,18 @@ class NotesClient:
     def get(self, slug: str) -> dict:
         return self.one("get_note", slug=slug)
 
-    def list(self) -> list[dict]:
+    def list(self, *, kind: str | None = None, collection: str | None = None,
+             query: str | None = None) -> list[dict]:
+        filters = {key: value for key, value in
+                   {"kind": kind, "collection": collection, "query": query}.items() if value is not None}
         notes: list[dict] = []
         while True:
-            page = self.one("list_notes", limit=200, offset=len(notes)).get("notes") or []
-            notes.extend(item for item in page if isinstance(item, dict))
+            page = self.one("list_notes", limit=200, offset=len(notes), **filters).get("notes")
+            if not isinstance(page, list) or len(page) > 200 or any(not isinstance(item, dict) for item in page):
+                raise NotesError("notes_bad_response", "list_notes returned an invalid page")
+            if filters and any("kind" not in item or "collection" not in item for item in page):
+                raise NotesError("notes_library_unavailable", "filtered listing requires the Notes library")
+            notes.extend(page)
             if len(page) < 200:
                 return notes
 
@@ -169,10 +179,14 @@ class NotesClient:
         return self.one("create_share_link", slug=slug, ttl_hours=hours)
 
     def revoke_shares(self, slug: str) -> dict:
-        links = self.one("list_share_links", slug=slug).get("links") or []
+        return {"slug": slug, "revoked": self.revoke_target_shares(slug=slug)}
+
+    def revoke_target_shares(self, **target) -> list[int]:
+        links = self.one("list_share_links", **target).get("links") or []
         active = [link["id"] for link in links
                   if isinstance(link, dict) and link.get("status") == "active"
-                  and isinstance(link.get("id"), int)]
+                  and type(link.get("id")) is int
+                  and all(link.get(key) == value for key, value in target.items())]
         if active:
             results = self.many([{"tool": "revoke_share_link", "arguments": {"id": ident}}
                                  for ident in active])
@@ -180,11 +194,11 @@ class NotesClient:
             if failed:
                 raise NotesError("notes_failed", "some share links were not revoked",
                                  revoked=[i for i in active if i not in failed], failed=failed)
-        return {"slug": slug, "revoked": active}
+        return active
 
     # -- sync ---------------------------------------------------------------
 
-    def _adopt(self, names, texts, entries, *, adopt, fail, run) -> list[str]:
+    def _adopt(self, names, texts, entries, *, collection, adopt, fail, run) -> list[str]:
         """Find already-published notes for unmapped files; return the files still to create.
 
         Candidates are tailnet markdown notes not in this map. A file matches the one
@@ -198,7 +212,8 @@ class NotesClient:
         for n in self.list():      # offset paging can repeat a note under concurrent edits
             if (n.get("slug") not in mapped and n.get("slug") not in seen
                     and n.get("format", "markdown") == "markdown"
-                    and n.get("visibility", "tailnet") == "tailnet"):
+                    and n.get("visibility", "tailnet") == "tailnet"
+                    and n.get("collection") in (None, collection)):
                 seen.add(n.get("slug"))
                 existing.append(n)
         hint = (f"map the right slug for this file in {MAP_FILE}, or rerun with --adopt "
@@ -273,6 +288,8 @@ class NotesClient:
         for name in [n for n, e in entries.items() if not (isinstance(e, dict) and e.get("slug"))]:
             del entries[name]   # a damaged entry is treated as never published
         root = directory.resolve()
+        collection = re.sub(r"[^a-z0-9]+", "-", root.name.lower()).strip("-")[:120] or None
+        collection_arg = {"collection": collection} if collection is not None else {}
         files = sorted(p for p in directory.iterdir()
                        if p.is_file() and not p.name.startswith(".")
                        and p.suffix.lower() in SYNC_SUFFIXES
@@ -282,18 +299,21 @@ class NotesClient:
                   "created": [], "adopted": [], "updated": [], "recreated": [], "unchanged": [],
                   "orphaned": [], "pruned": [], "failed": []}
         texts = {}
-        updates, creates = [], []
+        updates, creates, collection_only = [], [], set()
         for path in files:
             text = read_text(path)
             title = title_for(path, text, html=False)
             texts[path.name] = (text, title)
             entry = entries.get(path.name)
             if entry is not None:
-                if entry.get("sha256") == sha256(text) and entry.get("title") == title:
+                same_content = entry.get("sha256") == sha256(text) and entry.get("title") == title
+                if same_content and (collection is None or entry.get("collection") == collection):
                     report["unchanged"].append({"file": path.name, "slug": entry["slug"],
                                                 "url": entry.get("url")})
                 else:
                     updates.append(path.name)
+                    if same_content:
+                        collection_only.add(path.name)
             else:
                 creates.append(path.name)
 
@@ -316,7 +336,7 @@ class NotesClient:
         def record(name, data, bucket):
             text, title = texts[name]
             entries[name] = {"slug": data.get("slug"), "url": data.get("url"),
-                             "title": title, "sha256": sha256(text)}
+                             "title": title, "sha256": sha256(text), "collection": data.get("collection")}
             report[bucket].append({"file": name, "slug": data.get("slug"), "url": data.get("url")})
 
         def not_found(result):
@@ -334,14 +354,29 @@ class NotesClient:
 
         def update_calls(slugs):
             return [{"tool": "update_note", "arguments": {
-                "slug": slug, "title": texts[name][1], "content": texts[name][0],
-                "filename": Path(name).stem}} for name, slug in slugs]
+                "slug": slug, **collection_arg,
+                **({} if name in collection_only else {
+                    "title": texts[name][1], "content": texts[name][0], "filename": Path(name).stem}),
+            }} for name, slug in slugs]
 
-        # Mapped files first: they need no lookup, so a failed lookup cannot block them.
+        # Update changed files first. Check server support only for old map entries
+        # whose content has not changed and whose collection still needs backfilling.
         if updates:
-            each(updates, update_calls([(n, entries[n]["slug"]) for n in updates]), updated)
+            changed = [name for name in updates if name not in collection_only]
+            if changed:
+                each(changed, update_calls([(n, entries[n]["slug"]) for n in changed]), updated)
+        if collection_only:
+            pending = sorted(collection_only)
+            sample = self.one("list_notes", limit=1).get("notes")
+            if not isinstance(sample, list) or any(not isinstance(item, dict) for item in sample):
+                raise NotesError("notes_bad_response", "list_notes returned an invalid page")
+            if sample and "collection" not in sample[0]:
+                report["unchanged"].extend({"file": n, "slug": entries[n]["slug"], "url": entries[n].get("url")}
+                                           for n in pending)
+            else:
+                each(pending, update_calls([(n, entries[n]["slug"]) for n in pending]), updated)
         if creates and not create_duplicates:
-            creates = self._adopt(creates, texts, entries, adopt=adopt, fail=fail,
+            creates = self._adopt(creates, texts, entries, collection=collection, adopt=adopt, fail=fail,
                                   run=lambda slugs: each([n for n, _ in slugs], update_calls(slugs),
                                                          lambda name, result: record(
                                                              name, result.get("result") or {},
@@ -351,7 +386,7 @@ class NotesClient:
         if creates:
             each(creates, [{"tool": "create_note", "arguments": {
                 "title": texts[name][1], "content": texts[name][0],
-                "filename": Path(name).stem}} for name in creates],
+                "filename": Path(name).stem, **collection_arg}} for name in creates],
                 lambda name, result: record(name, result.get("result") or {},
                                             "recreated" if name in recreate else "created")
                 if result.get("ok") else fail(name, result))

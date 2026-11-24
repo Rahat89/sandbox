@@ -41,7 +41,9 @@ def configure_notes(parser) -> None:
     _common(p)
     p.add_argument("--file", required=True)
     p.add_argument("--title")
-    p.add_argument("--html", action="store_true", help="the file is one complete HTML document")
+    p.add_argument("--page", "--html", dest="html", action="store_true",
+                   help="publish one complete HTML document")
+    p.add_argument("--collection", help="group this note or page under a collection name")
     p.add_argument("--public", action="store_true",
                    help="anyone on the internet can open it; only for notes with nothing private")
 
@@ -58,6 +60,9 @@ def configure_notes(parser) -> None:
 
     p = actions.add_parser("list", help="list your notes")
     _common(p)
+    p.add_argument("--kind", choices=("note", "page"))
+    p.add_argument("--collection")
+    p.add_argument("--query", help="search titles and content")
 
     p = actions.add_parser("sync", help="publish every .md file in a folder, rerunnable")
     _common(p)
@@ -86,8 +91,7 @@ def configure_notes(parser) -> None:
 
 
 def configure_mockups(parser) -> None:
-    parser.description = ("Publish a folder (index.html plus its files) as one HTML note "
-                          "with image assets. See docs/agent-notes.md.")
+    parser.description = "Publish and restore versioned mockup folders. See docs/agent-notes.md."
     actions = parser.add_subparsers(dest="mockups_action", required=True, metavar="ACTION")
 
     p = actions.add_parser("publish", help="publish a new mockup; refuses an existing name")
@@ -95,37 +99,56 @@ def configure_mockups(parser) -> None:
     p.add_argument("directory")
     p.add_argument("--name", required=True)
     p.add_argument("--title")
-    p.add_argument("--public", action="store_true",
-                   help="anyone on the internet can open it; only for mockups with nothing private")
+    p.add_argument("--message", default="", help="describe this version")
+    p.add_argument("--dry-run", action="store_true", help="list the files without uploading")
 
     p = actions.add_parser("update", help="republish a mockup; same name, same URL")
     _common(p)
     p.add_argument("name")
     p.add_argument("directory")
-    p.add_argument("--title")
+    p.add_argument("--message", default="", help="describe this version")
+    p.add_argument("--dry-run", action="store_true", help="list the files without uploading")
 
     p = actions.add_parser("list", help="list mockups")
     _common(p)
+    p.add_argument("--query", help="search titles and names")
+    p.add_argument("--prefix", help="filter by name prefix")
     for name, text in (("get", "show one mockup"), ("delete", "delete one mockup and its assets")):
         p = actions.add_parser(name, help=text)
         _common(p)
         p.add_argument("name")
+        if name == "get":
+            p.add_argument("--version", type=_version)
+
+    p = actions.add_parser("versions", help="list a mockup's versions")
+    _common(p)
+    p.add_argument("name")
 
     p = actions.add_parser("pull", help="rebuild a mockup folder")
     _common(p)
     p.add_argument("name")
     p.add_argument("directory")
     p.add_argument("--force", action="store_true", help="write into a non-empty folder")
+    p.add_argument("--version", type=_version, help="restore this version instead of the latest")
 
     p = actions.add_parser("share", help="make or revoke expiring public share links")
     _common(p)
     p.add_argument("name")
+    p.add_argument("--version", type=_version, help="pin the share to this version")
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--ttl", help="lifetime, e.g. 24h or 7d")
     group.add_argument("--revoke", action="store_true", help="revoke every active link")
 
 
 # -- plumbing ----------------------------------------------------------------
+
+def _version(value: str) -> int:
+    import argparse
+
+    version = int(value)
+    if not 1 <= version <= 4294967295:
+        raise argparse.ArgumentTypeError("use a version number between 1 and 4294967295")
+    return version
 
 def _client(cfg, args):
     from sandbox.notes.service import NotesClient
@@ -241,7 +264,8 @@ def _notes(cfg, args) -> None:
 
     service, client = _client(cfg, args)
     if action == "create":
-        note = client.create(Path(args.file), title=args.title, html=args.html, public=args.public)
+        note = client.create(Path(args.file), title=args.title, html=args.html, public=args.public,
+                             collection=args.collection)
         _emit(args, {"ok": True, "note": note}, [note.get("slug", ""), note.get("url", "")])
     elif action == "update":
         note = client.update(args.slug, Path(args.file), title=args.title)
@@ -250,7 +274,7 @@ def _notes(cfg, args) -> None:
         note = client.get(args.slug)
         _emit(args, {"ok": True, "note": note}, [note.get("content") or ""])
     elif action == "list":
-        notes = client.list()
+        notes = client.list(kind=args.kind, collection=args.collection, query=args.query)
         _emit(args, {"ok": True, "count": len(notes), "notes": notes},
               [f"{n.get('slug')}  {n.get('updated_at')}  {n.get('title')}  {n.get('url')}"
                for n in notes] or ["(no notes)"])
@@ -297,26 +321,31 @@ def _mockups(cfg, args) -> None:
     mockups = Mockups(client)
     action = args.mockups_action
     if action == "publish":
-        note = mockups.publish(Path(args.directory), args.name, title=args.title, public=args.public)
-        _emit(args, {"ok": True, "mockup": note}, [note.get("url", "")])
+        note = mockups.publish(Path(args.directory), args.name, title=args.title, message=args.message,
+                               dry_run=args.dry_run)
+        _emit(args, {"ok": True, "mockup": note}, note["files"] if args.dry_run else [note.get("url", "")])
     elif action == "update":
-        note = mockups.update(args.name, Path(args.directory), title=args.title)
-        _emit(args, {"ok": True, "mockup": note}, [note.get("url", "")])
+        note = mockups.update(args.name, Path(args.directory), message=args.message, dry_run=args.dry_run)
+        _emit(args, {"ok": True, "mockup": note}, note["files"] if args.dry_run else [note.get("url", "")])
     elif action == "list":
-        items = mockups.list()
+        items = mockups.list(query=args.query, prefix=args.prefix)
         _emit(args, {"ok": True, "count": len(items), "mockups": items},
               [f"{m['name']}  {m.get('updated_at')}  {m.get('url')}" for m in items]
               or ["(no mockups)"])
     elif action == "get":
-        data = mockups.get(args.name)
-        assets = data.get("assets") or []
-        if not getattr(args, "json", False):
-            data.pop("content", None)
+        data = mockups.get(args.name, version=args.version)
         _emit(args, {"ok": True, "mockup": data},
-              [f"{data['name']}  {data.get('url')}", f"slug {data.get('slug')}  "
-               f"updated {data.get('updated_at')}  {len(assets)} asset(s)"])
+              [f"{args.name}  {data.get('version_url') or data.get('url', '')}",
+               f"version {data.get('version')}  {len(data.get('files') or [])} file(s)"])
+    elif action == "versions":
+        versions = mockups.get(args.name).get("versions")
+        if not isinstance(versions, list) or any(not isinstance(item, dict) for item in versions):
+            raise NotesError("notes_bad_response", "the service returned no version history")
+        _emit(args, {"ok": True, "name": args.name, "versions": versions},
+              [f"{v.get('number')}  {v.get('created_at')}  {v.get('message')}" for v in versions]
+              or ["(no published versions)"])
     elif action == "pull":
-        result = mockups.pull(args.name, Path(args.directory), force=args.force)
+        result = mockups.pull(args.name, Path(args.directory), version=args.version, force=args.force)
         _emit(args, {"ok": True, **result},
               [f"wrote {len(result['files'])} file(s) to {result['directory']}"])
     elif action == "delete":
@@ -324,13 +353,15 @@ def _mockups(cfg, args) -> None:
         _emit(args, {"ok": True, **result}, [f"deleted {args.name}"])
     elif action == "share":
         if args.revoke:
+            if args.version is not None:
+                raise NotesError("notes_input_invalid", "use --version with --ttl")
             result = mockups.revoke(args.name)
             _emit(args, {"ok": True, **result}, [f"revoked {len(result['revoked'])} link(s)"])
         else:
             from sandbox.notes.service import ttl_hours
             hours = ttl_hours(args.ttl)
             _refuse_in_job("creating a share link")
-            link = mockups.share(args.name, hours)
+            link = mockups.share(args.name, hours, version=args.version)
             link.pop("message", None)
             _emit(args, {"ok": True, "link": link},
                   [link.get("url", ""), f"expires {link.get('expires_at')}  id {link.get('id')}"])
@@ -347,7 +378,7 @@ def cmd_notes(cfg, args) -> None:
 
 
 def cmd_mockups(cfg, args) -> None:
-    """Publish a folder with index.html as an Agent Notes HTML mockup."""
+    """Publish versioned mockup folders."""
     try:
         _mockups(cfg, args)
     except NotesError as exc:
@@ -362,7 +393,7 @@ register_specs((
                 help="publish notes to the Agent Notes service (token held by the secrets broker)"),
     CommandSpec("mockups", cmd_mockups, configure=configure_mockups, owner=__name__,
                 scope="global", predispatch_policy=lambda _args: True,
-                help="publish a folder with index.html as an Agent Notes HTML mockup"),
+                help="publish and restore versioned mockup folders"),
 ))
 
 

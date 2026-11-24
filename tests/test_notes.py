@@ -23,7 +23,7 @@ import zlib
 from sandbox.notes import config as notes_config
 from sandbox.notes import login as notes_login
 from sandbox.notes.errors import NotesError
-from sandbox.notes.mockups import Mockups, read_manifest
+from sandbox.notes.mockups import Mockups
 from sandbox.notes.service import MAP_FILE, NotesClient, markdown_title, ttl_hours
 from tests.notes_fake_service import FakeNotes
 
@@ -237,6 +237,18 @@ class BrokerChildTests(FakeCase):
         self.assertEqual([r["code"] for r in results], ["notes_unauthorized"] * 3)
         self.assertEqual([bool(r.get("skipped")) for r in results], [False, True, True])
 
+    def test_mockup_upload_and_pull_through_the_broker_child(self):
+        transport, _ = self._transport(self.fake.add_token("sb-notes-ci"))
+        mockups = Mockups(NotesClient(transport, "fake"))
+        source = self.tmp / "screen"
+        source.mkdir()
+        (source / "index.html").write_text("<title>Screen</title>")
+        (source / "style.css").write_text("body { color: red; }")
+        self.assertEqual(mockups.publish(source, "screen")["version"], 1)
+        out = self.tmp / "out"
+        self.assertEqual(mockups.pull("screen", out)["files"], ["index.html", "style.css"])
+        self.assertEqual((out / "style.css").read_bytes(), (source / "style.css").read_bytes())
+
     def test_a_redirect_is_refused_and_the_token_never_follows_it(self):
         token = self.fake.add_token("sb-notes-ci")
         transport, _ = self._transport(token)
@@ -392,6 +404,38 @@ class SyncTests(FakeCase):
         self.assertEqual((len(report["created"]), len(self.fake.notes)), (1, 2))
         self.assertNotIn("list_notes", self.fake.calls)
 
+    def test_collection_backfill_leaves_remote_content_alone(self):
+        self._write("a.md", "# A\n")
+        slug = self.client.sync(self.tmp)["created"][0]["slug"]
+        state = self._map()
+        state["notes"]["a.md"].pop("collection")
+        (self.tmp / MAP_FILE).write_text(json.dumps(state))
+        self.fake.tool("update_note", {"slug": slug, "collection": None, "content": "# Remote edit\n"})
+        self.assertTrue(self.client.sync(self.tmp)["ok"])
+        self.assertEqual(self.fake.notes[slug]["content"], "# Remote edit\n")
+        self.assertEqual(self.fake.notes[slug]["collection"], self._map()["notes"]["a.md"]["collection"])
+
+    def test_sync_can_backfill_after_an_older_server_ignored_collection(self):
+        self._write("a.md", "# A\n")
+        original = self.fake.tool
+
+        def legacy(tool, args):
+            result, failed = original(tool, {k: v for k, v in args.items() if k != "collection"})
+            for row in result.get("notes", [result]):
+                row.pop("collection", None)
+                row.pop("kind", None)
+            return result, failed
+
+        with mock.patch.object(self.fake, "tool", side_effect=legacy):
+            slug = self.client.sync(self.tmp)["created"][0]["slug"]
+            self.assertIsNone(self._map()["notes"]["a.md"]["collection"])
+            self.assertEqual(len(self.client.sync(self.tmp)["unchanged"]), 1)
+            self.assertNotIn("update_note", self.fake.calls)
+            with self.assertRaisesRegex(NotesError, "requires the Notes library"):
+                self.client.list(kind="note")
+        self.assertEqual(len(self.client.sync(self.tmp)["updated"]), 1)
+        self.assertIsNotNone(self.fake.notes[slug]["collection"])
+
     def test_another_folders_note_with_the_same_file_name_is_never_overwritten(self):
         first, second = self.tmp / "a", self.tmp / "b"
         first.mkdir()
@@ -400,7 +444,7 @@ class SyncTests(FakeCase):
         (second / "README.md").write_text("# Project B\n")
         slug = self.client.sync(first)["created"][0]["slug"]
         report = self.client.sync(second)
-        self.assertEqual([i["code"] for i in report["failed"]], ["notes_adopt_differs"])
+        self.assertEqual([i["file"] for i in report["created"]], ["README.md"])
         self.assertEqual(self.fake.notes[slug]["content"], "# Project A\n")
 
     def test_public_and_html_notes_are_never_candidates(self):
@@ -526,95 +570,151 @@ class MockupTests(FakeCase):
                       '<img src="img/logo.png"><img src="img/icon.svg">'
                       "<div style=\"background:url('img/logo.png')\"></div></body></html>")
         (self.src / "index.html").write_text(self.index)
-        fake = self.fake
-        self.mockups = Mockups(self.client, fetch=lambda url: fake.assets[url.split("/")[-3]][
-            url.split("/")[-1]])
+        self.mockups = Mockups(self.client)
 
-    def test_publish_packs_the_folder_and_refuses_an_existing_name(self):
-        note = self.mockups.publish(self.src, "checkout")
-        stored = self.fake.notes[note["slug"]]
-        self.assertEqual((stored["format"], stored["filename"], stored["title"]),
-                         ("html", "mockup-checkout", "Checkout"))
-        self.assertEqual(len(self.fake.assets[note["slug"]]), 2)
-        html = stored["content"]
-        self.assertIn('<style data-sb-src="css/app.css">', html)
-        self.assertIn('nope.png', html)   # markup inside a script body is not a reference
-        self.assertIn("data:image/svg+xml;base64,", html)
-        self.assertIn("https://cdn.example/x.js?a=1&amp;b=2", html)
-        self.assertIn("background:url('/n/%s/assets/" % note["slug"], html)
-        self.assertEqual(set(read_manifest(html)["assets"].values()), {"img/logo.png", "img/bg.png"})
+    def test_publish_keeps_files_unmodified_and_refuses_an_existing_name(self):
+        published = self.mockups.publish(self.src, "checkout")
+        version = self.fake.mockups["checkout"]["versions"][1]
+        self.assertEqual(published["version"], 1)
+        self.assertEqual(version["index.html"].decode(), self.index)
+        self.assertEqual(version["img/icon.svg"], (self.src / "img/icon.svg").read_bytes())
+        self.assertEqual(self.mockups.list(prefix="check")[0]["title"], "Checkout")
         with self.assertRaises(NotesError) as caught:
             self.mockups.publish(self.src, "checkout")
         self.assertEqual(caught.exception.code, "mockup_exists")
-        self.assertEqual([m["name"] for m in self.mockups.list()], ["checkout"])
 
-    def test_update_keeps_the_url_and_drops_unused_images(self):
-        slug = self.mockups.publish(self.src, "checkout")["slug"]
-        (self.src / "css" / "app.css").write_text("body{color:red}\n")
-        (self.src / "img" / "bg.png").unlink()
-        note = self.mockups.update("checkout", self.src)
-        self.assertEqual(note["slug"], slug)
-        self.assertEqual((note["assets"], note["removed_assets"]), (1, 1))
-        self.assertEqual(len(self.fake.assets[slug]), 1)
-        self.assertEqual(len(self.fake.notes), 1)
+    def test_update_publishes_a_replacement_and_keeps_previous_files_and_share(self):
+        first = self.mockups.publish(self.src, "checkout")
+        link = self.mockups.share("checkout", 24, version=1)
+        (self.src / "img/bg.png").unlink()
+        (self.src / "page2.html").write_text("<p>two</p>")
+        second = self.mockups.update("checkout", self.src, message="second screen")
+        self.assertEqual((first["url"], second["url"], second["version"]), (first["url"], first["url"], 2))
+        info = self.mockups.get("checkout")
+        self.assertEqual([v["number"] for v in info["versions"]], [2, 1])
+        self.assertNotIn("img/bg.png", [f["path"] for f in info["files"]])
+        self.assertEqual(link["version"], 1)
+        out = self.tmp / "out"
+        result = self.mockups.pull("checkout", out, version=1)
+        self.assertEqual(result["version"], 1)
+        self.assertEqual(result["files"], ["css/app.css", "img/bg.png", "img/icon.svg", "img/logo.png",
+                                           "index.html", "js/app.js"])
+        self.assertEqual((out / "img/bg.png").read_bytes(), png((0, 0, 255)))
+        self.assertEqual((out / "index.html").read_text(), self.index)
+        self.assertEqual(self.mockups.revoke("checkout")["revoked"], [link["id"]])
 
-    def test_pull_rebuilds_the_folder(self):
+    def test_pull_will_not_write_on_a_hash_mismatch(self):
+        import base64
+        self.mockups.publish(self.src, "checkout")
+        original = self.fake.tool
+
+        def tamper(tool, args):
+            result, failed = original(tool, args)
+            if tool == "get_mockup" and args.get("path") == "index.html":
+                result["base64"] = base64.b64encode(b"x" * result["size_bytes"]).decode()
+            return result, failed
+
+        out = self.tmp / "out"
+        with mock.patch.object(self.fake, "tool", side_effect=tamper):
+            with self.assertRaisesRegex(NotesError, "could not be verified"):
+                self.mockups.pull("checkout", out)
+        self.assertFalse(out.exists())
+        self.assertEqual(list(self.tmp.glob(".mockup-*")), [])
+
+    def test_pull_rejects_path_traversal_and_force_does_not_follow_symlink(self):
+        self.mockups.publish(self.src, "checkout")
+        original = self.fake.tool
+
+        def tamper(tool, args):
+            result, failed = original(tool, args)
+            if tool == "get_mockup":
+                result["files"][0]["path"] = "../escaped"
+            return result, failed
+
+        out = self.tmp / "out"
+        with mock.patch.object(self.fake, "tool", side_effect=tamper):
+            with self.assertRaisesRegex(NotesError, "invalid mockup file manifest"):
+                self.mockups.pull("checkout", out)
+        out.mkdir()
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (out / "css").symlink_to(outside)
+        with self.assertRaises(OSError):
+            self.mockups.pull("checkout", out, force=True)
+        self.assertFalse((outside / "app.css").exists())
+
+    def test_symlink_is_refused_before_reserving_a_name(self):
+        (self.src / "img/leak.png").symlink_to(self.tmp / "other.png")
+        with self.assertRaises(NotesError):
+            self.mockups.publish(self.src, "checkout")
+        self.assertEqual(self.fake.mockups, {})
+
+    def test_legacy_mockup_revoke_leaves_note_shares_active(self):
+        note = self.client.one("create_note", title="t", content="c")
+        link = self.client.share(note["slug"], 1)
+        original = self.fake.tool
+
+        def legacy(tool, args):
+            if tool == "list_share_links":
+                args = {}
+            return original(tool, args)
+
+        with mock.patch.object(self.fake, "tool", side_effect=legacy):
+            self.assertEqual(self.mockups.revoke("checkout")["revoked"], [])
+        self.assertEqual(self.fake.links[0]["id"], link["id"])
+        self.assertEqual(self.fake.links[0]["status"], "active")
+        self.assertNotIn("revoke_share_link", self.fake.calls)
+
+    def test_failed_put_clears_its_draft_and_never_commits(self):
+        original = self.fake.tool
+
+        def fail_put(tool, args):
+            result, failed = original(tool, args)
+            if tool == "put_mockup_files" and args["files"]:
+                return {"error": "Could not store a file."}, True
+            return result, failed
+
+        with mock.patch.object(self.fake, "tool", side_effect=fail_put):
+            with self.assertRaisesRegex(NotesError, "Could not store a file"):
+                self.mockups.publish(self.src, "checkout")
+        self.assertTrue(all(not files for files in self.fake.mockups["checkout"]["drafts"].values()))
+        self.assertNotIn("commit_mockup", self.fake.calls)
+
+    def test_force_preflights_existing_paths_before_replacing_any_file(self):
         self.mockups.publish(self.src, "checkout")
         out = self.tmp / "out"
-        result = self.mockups.pull("checkout", out)
-        self.assertEqual(result["files"], ["css/app.css", "img/bg.png", "img/logo.png",
-                                           "index.html", "js/app.js"])
-        self.assertEqual((out / "img" / "logo.png").read_bytes(), png((255, 0, 0)))
-        self.assertEqual((out / "css" / "app.css").read_text(), "body{background:url(../img/bg.png)}\n")
-        self.assertEqual((out / "js" / "app.js").read_text(), (self.src / "js" / "app.js").read_text())
-        index = (out / "index.html").read_text()
-        self.assertIn('<link rel="stylesheet" href="css/app.css">', index)
-        self.assertIn("background:url('img/logo.png')", index)
-        self.assertNotIn("sb-mockup", index)
-        with self.assertRaises(NotesError):
-            self.mockups.pull("checkout", out)
+        (out / "css").mkdir(parents=True)
+        (out / "css/app.css").write_text("existing")
+        (out / "js").write_text("blocks the last file")
+        with self.assertRaises(OSError):
+            self.mockups.pull("checkout", out, force=True)
+        self.assertEqual((out / "css/app.css").read_text(), "existing")
+        self.assertFalse((out / "index.html").exists())
 
-    def test_missing_local_files_are_refused_before_anything_is_sent(self):
-        (self.src / "index.html").write_text('<img src="img/gone.png"><img src="../outside.png">')
-        with self.assertRaises(NotesError) as caught:
+    def test_dry_run_lists_files_and_git_checkouts_are_refused(self):
+        plan = self.mockups.publish(self.src, "checkout", dry_run=True)
+        self.assertIn("img/icon.svg", plan["files"])
+        self.assertFalse(self.fake.calls)
+        (self.src / ".git").mkdir()
+        with self.assertRaisesRegex(NotesError, "outside the repository checkout"):
             self.mockups.publish(self.src, "checkout")
-        self.assertIn("img/gone.png", caught.exception.message)
-        self.assertEqual(self.fake.notes, {})
+        self.assertFalse(self.fake.calls)
 
-    def test_a_symlink_out_of_the_folder_is_refused(self):
-        outside = self.tmp / "outside.png"
-        outside.write_bytes(png((1, 2, 3)))
-        (self.src / "img" / "leak.png").symlink_to(outside)
-        (self.src / "index.html").write_text('<img src="img/leak.png">')
-        with self.assertRaises(NotesError) as caught:
+    def test_upload_limits_apply_before_reserving_a_name(self):
+        with (self.src / "big.bin").open("wb") as handle:
+            handle.truncate(5 * 1024 * 1024 + 1)
+        with self.assertRaisesRegex(NotesError, "5 MiB"):
             self.mockups.publish(self.src, "checkout")
-        self.assertIn("img/leak.png", caught.exception.message)
-        self.assertEqual(self.fake.notes, {})
+        self.assertEqual(self.fake.mockups, {})
 
-    def test_page_links_are_left_alone(self):
-        (self.src / "page2.html").write_text("<p>two</p>")
-        (self.src / "index.html").write_text('<a href="page2.html">next</a><a href="gone.html">x</a>')
-        note = self.mockups.publish(self.src, "checkout")
-        html = self.fake.notes[note["slug"]]["content"]
-        self.assertIn('<a href="page2.html">', html)
-        self.assertIn('<a href="gone.html">', html)
-
-    def test_bad_names_are_refused(self):
-        for name in ("Bad Name", "a" * 54, "a-" * 26 + "aa", "foo-", "-foo", "a--b"):
-            with self.subTest(name=name), self.assertRaises(NotesError):
-                self.mockups.publish(self.src, name)
-        longest = "a" * 53
-        self.mockups.publish(self.src, longest)
-        self.assertEqual([m["name"] for m in self.mockups.list()], [longest])
-
-    def test_a_symlinked_index_is_refused(self):
-        outside = self.tmp / "outside.html"
-        outside.write_text("<p>private</p>")
-        (self.src / "index.html").unlink()
-        (self.src / "index.html").symlink_to(outside)
-        with self.assertRaises(NotesError):
-            self.mockups.publish(self.src, "checkout")
-        self.assertEqual(self.fake.notes, {})
+    def test_large_files_use_distinct_batches_under_one_draft(self):
+        for name in ("first.bin", "second.bin"):
+            with (self.src / name).open("wb") as handle:
+                handle.truncate(5 * 1024 * 1024)
+        self.mockups.publish(self.src, "checkout")
+        self.assertGreater(self.fake.calls.count("put_mockup_files"), 1)
+        self.assertEqual(self.fake.calls.count("commit_mockup"), 1)
+        self.assertEqual(len(self.fake.mockups["checkout"]["versions"][1]["second.bin"]), 5 * 1024 * 1024)
 
 
 class CliTests(FakeCase):
@@ -652,6 +752,18 @@ class CliTests(FakeCase):
         self.assertEqual((code, url), (0, f"{self.fake.url}/n/{slug}"))
         code, text = self.run_cli("notes", ["get", slug, "--json"])
         self.assertEqual(json.loads(text)["note"]["content"], "# Hi\n")
+
+    def test_page_aliases_and_filtered_listing(self):
+        page = self.tmp / "screen.html"
+        page.write_text("<title>Demo screen</title>")
+        for option in ("--page", "--html"):
+            code, text = self.run_cli("notes", ["create", "--file", str(page), option,
+                                                "--collection", "demos", "--json"])
+            self.assertEqual((code, json.loads(text)["note"]["kind"]), (0, "page"))
+        self.client.one("create_note", title="Demo note", content="markdown", collection="demos")
+        code, text = self.run_cli("notes", ["list", "--kind", "page", "--collection", "demos",
+                                          "--query", "screen", "--json"])
+        self.assertEqual((code, json.loads(text)["count"]), (0, 2))
 
     def test_errors_exit_1_with_a_json_envelope(self):
         code, text = self.run_cli("notes", ["delete", "nope", "--json"])
