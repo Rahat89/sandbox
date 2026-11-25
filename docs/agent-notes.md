@@ -2,7 +2,7 @@
 
 `sb notes` publishes markdown or HTML files to an
 [Agent Notes](https://github.com/alimuzzaman/agent-notes) service and manages them.
-`sb mockups` publishes a folder with an `index.html` as one HTML note. Any shell,
+`sb mockups` publishes a folder as a versioned mockup. Any shell,
 script, durable job or remote session that can run `./sb` can use them, with no
 MCP client setup.
 
@@ -93,10 +93,10 @@ Every action takes `--remote NAME` and `--json` (one JSON object on stdout;
 
 | Command | What it does |
 |---|---|
-| `create --file F [--title T] [--html] [--public]` | New note. Prints the slug and URL. The title defaults to the first heading (`<title>`/`<h1>` with `--html`), else the file name. `--html` stores one complete HTML document. `--public` serves it on the public host: only for notes with nothing private. |
+| `create --file F [--title T] [--page] [--collection C] [--public]` | Publishes a Markdown note or, with `--page`, one complete HTML document. `--html` is an alias for `--page`. Prints the slug and URL. `--public` serves the item on the public host. |
 | `update <slug> --file F [--title T]` | Replaces the content. Same slug, same URL. |
 | `get <slug>` | Prints the content (`--json`: the note, its assets included). |
-| `list` | All your notes, newest first. |
+| `list [--kind note\|page] [--collection C] [--query Q]` | Lists your notes and pages, newest first. `--query` searches titles and content. |
 | `delete <slug>` | Deletes the note and its assets. |
 | `sync <dir> [--prune] [--adopt \| --create-duplicates]` | One note per `*.md` file in `dir` (not recursive; dotfiles skipped). See below. |
 | `upload <slug> <file>` | Attaches a PNG, JPEG, GIF or WebP image. Prints the path to embed. |
@@ -110,7 +110,8 @@ a durable job, because job output is retained.
 
 `sync` keeps a folder of markdown files published:
 
-- The map `<dir>/.notes.json` records `file -> {slug, url, title, sha256}` and
+- The folder name becomes the collection. Notes in a different collection are not adoption candidates.
+- The map `<dir>/.notes.json` records `file -> {slug, url, title, sha256, collection}` and
   the remote it belongs to. A map for another remote is refused.
 - A file with no map entry is first looked up among your existing notes, so a
   lost map, or notes another client (such as an MCP session) already published,
@@ -152,41 +153,38 @@ a durable job, because job output is retained.
 
 ## `sb mockups`
 
-A mockup is a folder with an `index.html` and the files it uses. It is stored
-as one HTML note plus image assets. Its name (lowercase letters and digits with single inner `-`, up to 53) is kept as
-the note's download filename `mockup-<name>`, which is how the other commands
-find it.
+A mockup keeps a folder's published files together. Each update publishes a
+complete new version. Earlier versions still have their own URLs and files.
+Links and assets should use relative paths. If the folder has no `index.html`,
+Notes lists its screens and files.
 
 | Command | What it does |
 |---|---|
-| `publish <dir> --name N [--title T] [--public]` | New mockup. Refuses if `N` exists and points to `update`. |
-| `update N <dir> [--title T]` | Republishes: same note, same URL. Images no longer used are deleted. |
-| `list` / `get N` / `delete N` | List, show (`--json` includes the HTML), delete. |
-| `pull N <dir> [--force]` | Rebuilds the folder. Refuses a non-empty folder without `--force`. |
-| `share N --ttl 24h` / `share N --revoke` | As for notes. |
+| `publish <dir> --name N [--title T] [--message M]` | Reserves a new name and publishes version 1. Use `update` if the name is already yours. |
+| `update N <dir> [--message M]` | Publishes the folder as the next version. The main URL stays the same. |
+| `list [--query Q] [--prefix P]` | Lists your mockups. |
+| `get N [--version V]` / `versions N` | Shows a version or lists the full history. |
+| `pull N <dir> [--version V] [--force]` | Downloads a version and verifies each file before writing. `--force` replaces matching paths in an existing directory. |
+| `share N --ttl 24h [--version V]` | Creates a public link pinned to one version. It defaults to the current version. |
+| `share N --revoke` / `delete N` | Revokes active links or deletes the mockup and all its versions. |
 
-How the folder is packed:
+Use names with 1–120 lowercase letters, digits or hyphens, starting with a
+letter or digit. Put only the files you want viewers to see in the folder.
+Run `publish` or `update` with `--dry-run` to list those files before
+uploading. The CLI skips dotfiles and hidden directories and refuses Git
+checkouts, symlinks and special files. A version can hold up to 1,000 files,
+5 MiB per file and 25 MiB total.
 
-- Local stylesheets (`<link rel="stylesheet">`) and scripts (`<script src>`)
-  are inlined as `<style data-sb-src="path">` and `<script data-sb-src="path">`.
-- Local PNG, JPEG, GIF and WebP files referenced from `src`, `href`, `poster`,
-  `srcset` or CSS `url()` are uploaded as note assets, and their references
-  are rewritten to the asset paths. The service accepts up to 5 MB per image
-  by default and dedups identical images.
-- Any other local file (SVG, fonts) becomes a `data:` URI.
-- URLs with a scheme, `//`, `/` or `#` are left alone, and so are page links
-  (`<a href>`, `<area href>`). A local reference to a missing file, or to one
-  outside the folder (symlinks included), is refused before anything is sent.
-- Only `index.html` is packed. `import` statements inside scripts and other
-  pages of the folder are not followed.
-- A JSON manifest (`<script type="application/json" id="sb-mockup">`) maps each
-  asset path back to its file. `pull` uses it to write the images, stylesheets
-  and scripts back to their paths. SVGs and fonts come back inline.
+Notes stages files before publishing. If the commit reply is lost, check
+`sb mockups versions N` before uploading again. Mockups are private to the
+Tailnet unless you create a share link. Older one-document mockups remain
+available at their original note URLs and through `sb notes`.
+For versioned mockups, set the title at publish time. The old
+`update --title` and `publish --public` options have been removed.
 
-The note content limit is 1 MB, so large scripts or many data URIs can exceed it.
-The service allows 60 MCP calls a minute per token. The client waits and
-retries when it is rate limited, so a mockup with many images publishes slowly
-rather than failing.
+Versioned mockups, collections and filtered note listing require the Notes
+library feature on the server. The service must apply migration 003 and enable
+the library, visibility and HTML features before the client uses these commands.
 
 The broker child runs with a minimal environment (`PATH`, `HOME`, `TMPDIR`,
 locale). It uses Python's default CA store; `SSL_CERT_FILE` and `SSL_CERT_DIR`

@@ -24,6 +24,7 @@ class FakeNotes:
         self.notes: dict[str, dict] = {}
         self.assets: dict[str, dict[str, bytes]] = {}
         self.links: list[dict] = []
+        self.mockups: dict[str, dict] = {}
         self.tokens: list[dict] = []          # {"id", "name", "value", "revoked"}
         self.calls: list[str] = []
         self.trusted = True
@@ -59,6 +60,8 @@ class FakeNotes:
                                     "updated_at")}
         out["filename"] = note["filename"] + (".html" if note["format"] == "html" else ".md")
         out["size_bytes"] = len(note["content"].encode())
+        out["kind"] = "page" if note["format"] == "html" else "note"
+        out["collection"] = note.get("collection")
         out["url"] = f"{self.url}/n/{note['slug']}"
         if content:
             out["content"] = note["content"]
@@ -79,6 +82,7 @@ class FakeNotes:
             slug = secrets.token_hex(5)
             note = {"slug": slug, "title": args["title"], "content": args["content"],
                     "format": args.get("format", "markdown"),
+                    "collection": args.get("collection"),
                     "visibility": args.get("visibility", "tailnet"),
                     "filename": _slugify(args.get("filename") or args["title"]),
                     "created_at": stamp, "updated_at": stamp}
@@ -87,11 +91,18 @@ class FakeNotes:
             return {"message": "Note published.", **self._summary(note)}, False
         if name == "list_notes":
             ordered = sorted(self.notes.values(), key=lambda n: n["updated_at"], reverse=True)
+            ordered = [n for n in ordered
+                       if args.get("kind", self._summary(n)["kind"]) == self._summary(n)["kind"]
+                       and args.get("collection", n.get("collection")) == n.get("collection")
+                       and args.get("query", "").lower() in (n["title"] + " " + n["content"]).lower()]
             offset, limit = int(args.get("offset", 0)), min(int(args.get("limit", 50)), 200)
             page = ordered[offset:offset + limit]
             return {"count": len(page), "notes": [self._summary(n) for n in page]}, False
         if name == "list_share_links":
-            links = [dict(link) for link in self.links if not slug or link["slug"] == slug]
+            mockup = args.get("name")
+            links = [dict(link) for link in self.links if (
+                link.get("name") == mockup if mockup else
+                "slug" in link and (not slug or link["slug"] == slug))]
             return {"count": len(links), "links": links}, False
         if name == "revoke_share_link":
             for link in self.links:
@@ -99,10 +110,13 @@ class FakeNotes:
                     link["status"] = "revoked"
                     return {"message": "Share link revoked."}, False
             return {"error": "no active share link with that id on your notes"}, True
+        if name.endswith("_mockup") or name in ("put_mockup_files", "list_mockups") or (
+                name == "create_share_link" and "name" in args):
+            return self._mockup(name, args, stamp)
         if note is None:
             return {"error": f"note '{slug}' not found"}, True
         if name == "update_note":
-            for key in ("title", "content", "format", "visibility"):
+            for key in ("title", "content", "format", "visibility", "collection"):
                 if key in args:
                     note[key] = args[key]
             if "filename" in args:
@@ -138,6 +152,71 @@ class FakeNotes:
             self.links.append(link)
             return {"message": "Share link created.", **link,
                     "url": "https://share.example/s/" + secrets.token_hex(16)}, False
+        return {"error": "unknown"}, True
+
+    def _mockup(self, tool: str, args: dict, stamp: str) -> tuple[dict, bool]:
+        name = args.get("name")
+        mockup = self.mockups.get(name)
+        if tool == "create_mockup":
+            if mockup is not None:
+                return {"error": "That mockup name is already in use."}, True
+            summary = {"name": name, "title": args["title"], "current_version": None,
+                       "url": f"{self.url}/m/{name}/", "updated_at": stamp}
+            self.mockups[name] = {"summary": summary, "versions": {}, "drafts": {}, "history": []}
+            return dict(summary), False
+        if tool == "list_mockups":
+            offset, limit = args.get("offset", 0), args.get("limit", 50)
+            rows = [m["summary"] for m in self.mockups.values()
+                    if m["summary"]["name"].startswith(args.get("prefix", ""))
+                    and args.get("query", "") in (m["summary"]["name"] + m["summary"]["title"])]
+            page = rows[offset:offset + limit]
+            return {"count": len(page), "mockups": page}, False
+        if mockup is None:
+            return {"error": "Mockup not found."}, True
+        summary = mockup["summary"]
+        draft = args.get("draft")
+        if tool == "put_mockup_files":
+            drafts = mockup["drafts"]
+            if args.get("reset"):
+                drafts[draft] = {}
+            files = drafts.setdefault(draft, {})
+            for file in args["files"]:
+                files[file["path"]] = base64.b64decode(file["base64"], validate=True)
+            return {"name": name, "files": len(files), "size_bytes": sum(map(len, files.values()))}, False
+        if tool == "delete_mockup":
+            del self.mockups[name]
+            self.links[:] = [link for link in self.links if link.get("name") != name]
+            return {"name": name, "deleted": True}, False
+        if tool == "commit_mockup":
+            files = mockup["drafts"].pop(draft, None)
+            if not files:
+                return {"error": "Empty draft."}, True
+            version = len(mockup["versions"]) + 1
+            mockup["versions"][version] = files
+            mockup["history"].insert(0, {"number": version, "message": args["message"], "created_at": stamp})
+            summary["current_version"] = version
+        else:
+            version = args.get("version", summary["current_version"])
+            files = mockup["versions"].get(version, {})
+        url = summary["url"]
+        identity = {"name": name, "version": version}
+        version_url = f"{url}@{version}/" if version else None
+        if tool == "commit_mockup":
+            return {**identity, "url": url, "version_url": version_url}, False
+        if tool == "create_share_link":
+            link = {**identity, "id": len(self.links) + 1, "status": "active",
+                    "expires_at": "in %dh" % args.get("ttl_hours", 24)}
+            self.links.append(link)
+            return {**link, "url": "https://share.example/s/" + secrets.token_hex(16)}, False
+        if tool == "get_mockup":
+            rows = [{"path": path, "content_hash": hashlib.sha256(data).hexdigest(), "size_bytes": len(data)}
+                    for path, data in sorted(files.items())]
+            if "path" in args:
+                return next(({**identity, **row, "base64": base64.b64encode(files[row["path"]]).decode()}
+                             for row in rows if row["path"] == args["path"]),
+                            {"error": "File not found in this version."}), args["path"] not in files
+            return {**summary, **identity, "version_url": version_url,
+                    "versions": mockup["history"], "files": rows}, False
         return {"error": "unknown"}, True
 
     # -- HTTP ---------------------------------------------------------------
