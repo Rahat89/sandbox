@@ -2095,7 +2095,8 @@ database and Mailpit. `down` and `ttl` refuse a stack another owner holds
 **Hosted.** `--lifetime hosted` needs the ref to be the template's `stack.dev_branch`
 (default `dev`), and only one hosted stack per repo exists on a remote
 (`stack_hosted_taken`). A hosted stack re-run at another ref is refused. After a
-confirmed `up` of the hosted stack, `up` runs the merge sweep for that repo.
+confirmed `up` of the hosted stack, `up` runs the merge sweep for that repo
+on stacks with the same owner.
 
 **Merges.** The server has no Git history, so a controller decides: `stack sweep`
 fetches `origin/<dev_branch>` in a local checkout of the record's repo (recorded
@@ -2259,8 +2260,8 @@ follow did not start is never retired: the attempt fails with
 that fails names the same command (`follow_predecessor_retire_failed`); one that closed
 the delivery but could not take the host state lock within 600 s fails
 `follow_predecessor_cleanup_pending` and names `sb host status` for the stack. A predecessor
-whose job still runs makes the attempt `busy`. A canonical stack's apply also runs the stack merge sweep
-(spec 077), as a person's would.
+whose job still runs makes the attempt `busy`. A canonical stack's apply also
+checks its owner's temporary stacks for merges (spec 077).
 
 **Owner controls.** `pause` stops new attempts (one already running finishes and is
 recorded) and `resume` re-enables them without retrying failed heads. `run-now` sets a

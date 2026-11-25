@@ -1470,6 +1470,20 @@ class StackCommandTests(unittest.TestCase):
                          ("sandbox-env/dev", "dev", overlay))
         self.assertTrue(remote.stack.canonical)
 
+    def test_hosted_up_does_not_sweep_another_owners_copy(self):
+        with patch.object(host_stack, "_submit", return_value="job-follow"):
+            self.owner = dict(OWNER_B)
+            host_stack._up(self.args("up", confirm=True, name="other"))
+            self.owner = dict(OWNER_A)
+            host_stack._up(self.args("up", confirm=True, name="mine"))
+            dev_head, _overlay = self._overlay_on_dev()
+            with patch("sandbox.hosting.lifetime.merge.sweep", return_value={}) as sweep:
+                host_stack._up(self.args("up", confirm=True, lifetime="hosted", ref="sandbox-env/dev",
+                                         name="dev", follow_source={"branch": "dev", "commit": dev_head}))
+        considered = {item["slug"] for item in sweep.call_args.kwargs["remote_records"]}
+        self.assertIn("mine", considered)
+        self.assertNotIn("other", considered)
+
     def test_a_follow_ref_that_does_not_descend_from_the_tracked_head_is_refused(self):
         _dev_head, overlay = self._overlay_on_dev()
         _git(self.hub, "checkout", "--quiet", "--orphan", "unrelated")

@@ -971,11 +971,14 @@ def _up_timed(args, plan: bool, confirm: bool, clock) -> dict:
         registry.put(record)
     clock.finish()
     if record["canonical"]:
-        # The dev stack just moved: every temporary copy merged into dev is now
-        # eligible. Best effort; the TTL still applies if this cannot run.
+        # A dev apply can mark its owner's merged copies for early cleanup.
         from sandbox.hosting.lifetime import merge
         try:
-            sweep = merge.sweep(store, remote_records=store.list().get("records") or [],
+            owner_label = (record.get("owner") or {}).get("label")
+            holdings = store.list().get("records") or []
+            owned = [item for item in holdings if owner_label and
+                     (item.get("owner") or {}).get("label", "").lower() == owner_label.lower()]
+            sweep = merge.sweep(store, remote_records=owned,
                                 checkouts={repo: checkout}, dev_branch=template.dev_branch,
                                 repo=repo, confirm=True)
         except (hosting.HostingError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
