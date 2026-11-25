@@ -226,6 +226,21 @@ def probe_ports(entry: dict) -> dict[int, set[str]]:
     return parse_port_probe(output)
 
 
+def probe_tailnet_ports(entry: dict) -> frozenset[int]:
+    """A managed route can keep a port in use after its listener is gone."""
+    from sandbox.hosting.tailnet_names import remote_program
+    from sandbox.hosting.tailnet_names.models import TailnetNameError
+    try:
+        result = remote_program.call(entry, "loopback-ports", {}, timeout=20)
+    except (TailnetNameError, RuntimeError, OSError, subprocess.SubprocessError):
+        raise StackCommandError(PROBE_UNAVAILABLE, "could not read managed Tailnet upstreams") from None
+    ports = result.get("ports")
+    if result.get("ok") is not True or not isinstance(ports, list) or len(ports) > 1000 or any(
+            type(port) is not int or not 1 <= port <= 65535 for port in ports):
+        raise StackCommandError(PROBE_UNAVAILABLE, "could not verify managed Tailnet upstreams")
+    return frozenset(ports)
+
+
 # ---------------------------------------------------------------- durable job
 
 class JobStateUnavailable(RuntimeError):
@@ -789,12 +804,17 @@ def _up_timed(args, plan: bool, confirm: bool, clock) -> dict:
         state = hosting.load_host_state()
         other_ports = stack_registry.ports_of_other_stacks(data, remote_name, slug)
         other_ports.update(_remote_ports(remote_records, compose_project))
+        existing = (record or {}).get("ports") or {}
+        needs_port = any(not isinstance(existing.get(name), int) or
+                         pins.get(name, existing.get(name)) != existing.get(name)
+                         for name in template.ports)
         ports = stack_registry.allocate_ports(
             remote_name=remote_name, slug=slug, names=template.ports,
-            existing=(record or {}).get("ports") or {}, pins=pins,
+            existing=existing, pins=pins,
             other_stacks=other_ports,
             reserved=_reserved_loopback_ports(state, remote_name),
             bound=probe_ports(entry) if template.ports else {},
+            tailnet_ports=probe_tailnet_ports(entry) if needs_port and front_door == "nginx" else frozenset(),
             own_compose_project=compose_project)
         return record, ports, state
 

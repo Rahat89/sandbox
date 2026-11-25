@@ -299,14 +299,17 @@ def parse_pins(values: list[str] | None, declared: tuple[str, ...]) -> dict[str,
 def allocate_ports(*, remote_name: str, slug: str, names: tuple[str, ...],
                    existing: Mapping[str, int], pins: Mapping[str, int],
                    other_stacks: Mapping[int, str], reserved: set[int],
-                   bound: Mapping[int, set[str]], own_compose_project: str) -> dict[str, int]:
+                   bound: Mapping[int, set[str]], own_compose_project: str,
+                   tailnet_ports: frozenset[int] = frozenset()) -> dict[str, int]:
     """Choose one port per name.
 
     ``other_stacks`` maps ports recorded for other stacks on the remote to their
     slug; ``reserved`` holds recorded hosting loopback ports; ``bound`` maps each
     port listening on the remote to the Compose projects publishing it (empty
     for a non-Docker listener). A port bound only by ``own_compose_project`` is
-    this stack's own and stays usable.
+    this stack's own and stays usable. A managed Tailnet route reserves its
+    upstream for new allocations, including pins. Keeping a port already
+    recorded for the same stack and name does not retarget the route.
     """
     def foreign_binding(port: int) -> bool:
         owners = bound.get(port)
@@ -319,6 +322,9 @@ def allocate_ports(*, remote_name: str, slug: str, names: tuple[str, ...],
         if port in reserved:
             raise StackRegistryError(
                 PORT_UNAVAILABLE, f"{how} port {name}={port} is a recorded hosting loopback port")
+        if port in tailnet_ports and existing.get(name) != port:
+            raise StackRegistryError(
+                PORT_UNAVAILABLE, f"{how} port {name}={port} is an upstream of a managed Tailnet route")
         if foreign_binding(port):
             owners = ", ".join(sorted(bound[port])) or "a non-Docker process"
             raise StackRegistryError(
@@ -339,7 +345,8 @@ def allocate_ports(*, remote_name: str, slug: str, names: tuple[str, ...],
         offset = int(hashlib.sha256(f"{remote_name}/{slug}/{name}".encode()).hexdigest()[:8], 16) % span
         for index in range(span):
             candidate = STACK_PORT_RANGE.start + (offset + index) % span
-            if (candidate in other_stacks or candidate in reserved or foreign_binding(candidate)
+            if (candidate in other_stacks or candidate in reserved or candidate in tailnet_ports
+                    or foreign_binding(candidate)
                     or candidate in chosen.values()):
                 continue
             chosen[name] = candidate

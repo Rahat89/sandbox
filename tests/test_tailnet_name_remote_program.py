@@ -547,6 +547,29 @@ class ActivationTests(Base):
 
 
 class InspectTests(Base):
+    def test_loopback_ports_waits_for_the_edge_lock(self):
+        with open(self.paths["edge_lock"], "wb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            busy = self.call("loopback-ports", lock_wait=0)
+            self.assertEqual((busy["ok"], busy["code"]), (False, "lock_busy"))
+            with mock.patch.object(rp.time, "sleep",
+                                   side_effect=lambda _: fcntl.flock(lock, fcntl.LOCK_UN)) as wait:
+                self.assertEqual(self.call("loopback-ports"), {"ok": True, "ports": []})
+            wait.assert_called_once()
+
+    def test_reserves_the_upstream_of_a_managed_block_without_a_listener(self):
+        self.publish()
+        self.assertEqual(self.call("loopback-ports"), {"ok": True, "ports": [8025]})
+        # An operator can hold a rollback copy outside nginx's include glob.
+        self.conf.rename(self.conf.with_suffix(".conf.disabled"))
+        self.assertEqual(self.call("loopback-ports"), {"ok": True, "ports": []})
+
+    def test_incomplete_route_inventory_is_refused(self):
+        self.publish()
+        self.conf.write_text("server {}\n")
+        result = self.call("loopback-ports")
+        self.assertEqual((result["ok"], result["code"]), (False, "unmanaged_block"))
+
     def test_inspect_reports_locks_binding_ownership_and_activation(self):
         self.publish()
         (Path(self.paths["conf_dir"]) / "sandbox-other.conf").write_text("server {}\n")

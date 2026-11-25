@@ -1877,7 +1877,11 @@ by one read-only SSH probe (`ss` plus Docker's published ports) so it is not bou
 anything except the stack's own containers, and distinct from other stacks' ports and
 recorded hosting loopback ports. The port is recorded with the stack and reused by
 every later `up`; only `stack down` releases it. `--port NAME=N` pins a port (1024-65535)
-and is refused when another stack owns it or something else is bound to it. New web
+and is refused when another stack owns it or something else is bound to it. On nginx
+remotes, a managed Tailnet route also reserves its upstream port even when no process
+is listening there. This protects ports left behind by older hand-added Mailpit
+aliases. Existing assignments stay in place. A new assignment, including a pin, must
+use another port or wait for the route's owner to retire the alias. New web
 loopback allocations skip 18100-18199; ports already recorded are untouched. Use the
 port in Compose through the value, for example
 `"127.0.0.1:${MAILPIT_PORT:-8025}:8025"`; the value reaches Compose through the

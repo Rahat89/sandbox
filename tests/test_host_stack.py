@@ -388,6 +388,14 @@ class PortAllocationTests(unittest.TestCase):
         own = {18150: {"sandbox-host-xspeed-hub-demo-sandbox"}}
         self.assertEqual(self.allocate(existing={"mailpit": 18150}, bound=own)["mailpit"], 18150)
 
+    def test_stale_tailnet_route_reserves_unbound_port_for_new_assignments(self):
+        port = self.allocate()["mailpit"]
+        routes = frozenset({port})
+        self.assertNotEqual(self.allocate(tailnet_ports=routes)["mailpit"], port)
+        with self.assertRaisesRegex(stack_registry.StackRegistryError, "managed Tailnet route"):
+            self.allocate(tailnet_ports=routes, pins={"mailpit": port})
+        self.assertEqual(self.allocate(tailnet_ports=routes, existing={"mailpit": port})["mailpit"], port)
+
     def test_pins(self):
         self.assertEqual(self.allocate(pins={"mailpit": 8025})["mailpit"], 8025)
         for overrides in ({"other_stacks": {8025: "pr-1"}},
@@ -706,6 +714,9 @@ class StackCommandTests(unittest.TestCase):
         self.probe = patch.object(host_stack, "probe_ports", return_value={})
         self.probe.start()
         self.addCleanup(self.probe.stop)
+        self.tailnet_probe = patch.object(host_stack, "probe_tailnet_ports", return_value=frozenset())
+        self.tailnet_ports = self.tailnet_probe.start()
+        self.addCleanup(self.tailnet_probe.stop)
         state = patch.object(host_stack.hosting, "load_host_state",
                              return_value={"version": 1, "hosts": {}})
         state.start()
@@ -763,6 +774,43 @@ class StackCommandTests(unittest.TestCase):
         _git(self.hub, "commit", "-m", "declare public service URL")
         _git(self.hub, "branch", "-f", "stack/demo")
         return _git(self.hub, "rev-parse", "HEAD")
+
+    def test_tailnet_route_is_rechecked_before_confirming_a_stack(self):
+        plan = host_stack._up(self.args("up", plan=True))
+        port = plan["ports"]["mailpit"]
+        self.tailnet_ports.return_value = frozenset({port})
+        with patch.object(host_stack, "_submit", return_value="job-mail") as submit:
+            with self.assertRaisesRegex(stack_registry.StackRegistryError, "managed Tailnet route"):
+                host_stack._up(self.args("up", confirm=True, port=[f"mailpit={port}"]))
+            self.assertEqual(self.remote_records(), {})
+            submit.assert_not_called()
+            result = host_stack._up(self.args("up", confirm=True))
+        self.assertNotEqual(result["ports"]["mailpit"], port)
+
+    def test_tailnet_probe_timeout_refuses_before_record_or_submission(self):
+        self.tailnet_probe.stop()
+        with patch("sandbox.hosting.tailnet_names.remote_program.call",
+                   side_effect=subprocess.TimeoutExpired("ssh", 20)), \
+                patch.object(host_stack, "_submit") as submit:
+            with self.assertRaises(host_stack.StackCommandError) as raised:
+                host_stack._up(self.args("up", confirm=True))
+            self.assertEqual(raised.exception.code, host_stack.PROBE_UNAVAILABLE)
+            self.assertEqual(self.remote_records(), {})
+            self.assertEqual(stack_registry.read()["stacks"], {})
+            submit.assert_not_called()
+
+    def test_reapply_with_the_same_port_does_not_probe_tailnet_routes(self):
+        with patch.object(host_stack, "_submit", return_value="job-mail"), \
+                patch.object(host_stack, "job_view", return_value={"lifecycle": "succeeded"}):
+            result = host_stack._up(self.args("up", confirm=True))
+            port = result["ports"]["mailpit"]
+            self.tailnet_ports.reset_mock()
+            plan = host_stack._up(self.args("up", plan=True, port=[f"mailpit={port}"]))
+            self.assertEqual(plan["ports"]["mailpit"], port)
+            self.tailnet_ports.assert_not_called()
+            plan = host_stack._up(self.args("up", plan=True, port=[f"mailpit={port + 1}"]))
+            self.assertEqual(plan["ports"]["mailpit"], port + 1)
+            self.tailnet_ports.assert_called_once_with(self.entry)
 
     def test_only_the_committed_declared_fact_reaches_the_record(self):
         expected = [{"label": "API", "kind": "url", "value": "https://service.example.test"}]

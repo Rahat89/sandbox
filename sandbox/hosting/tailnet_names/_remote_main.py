@@ -938,6 +938,63 @@ def inspect(payload, paths, runner, lock_wait):
             "inventory": rows}
 
 
+def loopback_ports(payload, paths, runner, lock_wait):
+    """Reserve ports still referenced by managed nginx routes on disk."""
+    # Avoid reading a temporarily removed block before nginx has reloaded.
+    lock = None
+    try:
+        try:
+            lock = os.open(paths["edge_lock"], os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            pass
+        if lock is not None:
+            if not _lock_inode_ok(os.fstat(lock), paths):
+                raise Refusal("path_unsafe", "untrusted nginx edge lock")
+            deadline = time.monotonic() + min(lock_wait, 8)
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise Refusal("lock_busy", "nginx route update in progress") from None
+                    time.sleep(min(0.1, remaining))
+        return {"ok": True, "ports": _managed_loopback_ports(paths)}
+    finally:
+        if lock is not None:
+            os.close(lock)
+
+
+def _managed_loopback_ports(paths):
+    ports = set()
+    deadline = time.monotonic() + 8
+    conf = _open_dir(paths["conf_dir"], paths)
+    try:
+        with os.scandir(conf) as entries:
+            for index, entry in enumerate(entries):
+                if index >= 1000 or time.monotonic() > deadline:
+                    raise Refusal("observation_timeout", "incomplete nginx route inventory")
+                if not (entry.name.startswith(FILE_PREFIX) and entry.name.endswith(".conf")):
+                    continue
+                fqdn = _fqdn(entry.name[len(FILE_PREFIX):-len(".conf")])
+                block, managed = _block(conf, fqdn, paths)
+                header = _header(block) if managed else None
+                if not header or header.get("version") != 1:
+                    raise Refusal("unmanaged_block", "managed route inventory cannot be verified")
+                upstream = header.get("upstream")
+                if not isinstance(upstream, str):
+                    raise Refusal("unmanaged_block", "managed route has no upstream")
+                address, separator, raw_port = upstream.rpartition(":")
+                if not separator or not re.fullmatch(r"[0-9]{1,5}", raw_port) or not 1 <= int(raw_port) <= 65535:
+                    raise Refusal("unmanaged_block", "managed route has an invalid upstream")
+                if address == "localhost" or ipaddress.IPv4Address(address).is_loopback:
+                    ports.add(int(raw_port))
+    finally:
+        os.close(conf)
+    return sorted(ports)
+
+
 def mail_access(payload, paths, runner, lock_wait):
     """Read-only panel projection; private key contents are never opened."""
     ip = _tailnet_ip(payload.get("tailnet_ip"))
@@ -1414,7 +1471,7 @@ def remove(payload, paths, runner, lock_wait):
         scope.close()
 
 
-ACTIONS = {"inspect": inspect, "mail-access": mail_access,
+ACTIONS = {"inspect": inspect, "mail-access": mail_access, "loopback-ports": loopback_ports,
            "reserve": reserve, "extend": extend, "release": release,
            "settle": settle, "csr": csr,
            "commit": commit, "remove": remove}
