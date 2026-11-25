@@ -92,7 +92,14 @@ INVOCATION_STARTED_MONOTONIC = time.monotonic()
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from sandbox.cli import main
-
 if __name__ == "__main__":
-    main(invocation_started_monotonic=INVOCATION_STARTED_MONOTONIC)
+    import fcntl
+    from sandbox.controller_update.usage import open_lock
+
+    with open_lock(ROOT) as checkout_lock:
+        if checkout_lock is not None:
+            fcntl.flock(checkout_lock, fcntl.LOCK_SH)
+        from sandbox.cli import main
+
+        main(invocation_started_monotonic=INVOCATION_STARTED_MONOTONIC,
+             release_checkout=checkout_lock.close if checkout_lock is not None else None)

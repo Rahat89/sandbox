@@ -189,6 +189,12 @@ def cmd_setup(cfg, args) -> None:
         except SystemExit:
             pass  # doctor exits 1 on problems; keep going to print next steps
 
+    if not server:
+        from sandbox.controller_update.daily import install_schedule
+        schedule = install_schedule(ROOT)
+        if schedule:
+            info(schedule[1])
+
     print()
     ok("Setup complete.")
     print()

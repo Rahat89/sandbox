@@ -1,9 +1,7 @@
 """Decide and perform a controller fast-forward (spec 072, data-model.md).
 
-``run()`` is the only entry point. It never fetches from a remote server: the
-hints in the state file only nominate a revision, and the checkout's own
-GitHub ``origin`` decides whether that revision is published history on the
-branch the checkout follows.
+``run()`` accepts server hints and ``follow_main()`` checks the branch tip.
+The checkout's GitHub ``origin`` is the only source of published history.
 """
 from __future__ import annotations
 
@@ -18,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Callable, Iterator
 
-from sandbox.controller_update import gitops, state
+from sandbox.controller_update import gitops, state, usage
 from sandbox.controller_update.gitops import GitError
 from sandbox.controller_update.models import (
     AlreadyMoved, CheckoutState, Decision, Hint, NoAction, Policy, Recovered, RolledBack,
@@ -387,6 +385,59 @@ def _apply_locked(started: CheckoutState, candidates: list[Hint], policy: Policy
         return Skip(reason, _notice(reason, checkout, hint))
 
     target = _pick_target(checkout, valid, policy)
+    return _advance(checkout, target, policy, refresher, journal)
+
+
+def tracks_main(checkout: CheckoutState | None) -> bool:
+    return (checkout is not None and checkout.branch == "main"
+            and checkout.upstream == "origin/main"
+            and gitops.is_github_url(checkout.origin_url))
+
+
+def follow_main(root: Path, *, policy: Policy = Policy(),
+                refresher: Refresher = refresh_checkout,
+                lock_dir: Path | None = None) -> Decision:
+    """Check the published main branch without waiting for a server hint."""
+    lock_dir = lock_dir or default_lock_dir()
+    journal = journal_path(root, lock_dir)
+    busy = Skip(SkipReason.LOCKED, "sb: this checkout is in use. Try the update again later.")
+    if journal.exists():
+        with usage.exclusive(root) as idle:
+            if not idle:
+                return busy
+            recovered = _recover(root, lock_dir, policy)
+            if recovered is not None:
+                return recovered
+    with _exclusive(lock_path(root, lock_dir), policy.lock_wait) as held:
+        if not held:
+            return Skip(SkipReason.LOCKED, "sb: another process is updating this checkout.")
+        checkout = gitops.read_checkout(root, timeout=policy.git_timeout)
+        if not tracks_main(checkout):
+            return NoAction(SkipReason.NO_UPSTREAM)
+        if not checkout.clean:
+            return Skip(SkipReason.DIRTY, "sb: controller checkout has uncommitted changes.")
+        try:
+            gitops.fetch_upstream(root, "main", timeout=policy.fetch_timeout)
+        except GitError as exc:
+            return Skip(SkipReason.FETCH_FAILED, f"sb: could not fetch origin/main ({exc}).")
+        revision = gitops.ref_value(root, "refs/remotes/origin/main", timeout=policy.git_timeout)
+        if not revision or not gitops.is_ancestor(root, checkout.head, revision,
+                                                   timeout=policy.git_timeout):
+            return Skip(SkipReason.NOT_DESCENDANT, "sb: origin/main is not a fast-forward.")
+        if revision == checkout.head:
+            return NoAction(SkipReason.UP_TO_DATE)
+        with usage.exclusive(root) as idle:
+            if not idle:
+                return busy
+            if gitops.read_checkout(root, timeout=policy.git_timeout) != checkout:
+                return Skip(SkipReason.DIRTY, "sb: controller checkout changed during the fetch.")
+            target = Hint("origin", revision, "probe", time.time())
+            return _advance(checkout, target, policy, refresher, journal)
+
+
+def _advance(checkout: CheckoutState, target: Hint, policy: Policy,
+             refresher: Refresher, journal: Path) -> Decision:
+    root = checkout.root
     try:
         gitops.fast_forward(root, target.revision, timeout=policy.git_timeout)
     except GitError as exc:
@@ -400,7 +451,7 @@ def _apply_locked(started: CheckoutState, candidates: list[Hint], policy: Policy
         notices = (MCP_NOTICE,)
     failure = refresher(root, policy)
     if failure is None:
-        return Updated(old, new, upstream, notices)
+        return Updated(old, new, checkout.upstream, notices)
     try:
         # The journal outlives a crash between the ref and tree steps, so the
         # next run can finish the rollback (see _recover).

@@ -10,6 +10,27 @@ controller only ever fast-forwards to it.
 
 ## When it runs
 
+On macOS and Linux with a systemd user session, `sb setup` enables a daily
+client update at 09:00 local time for GitHub checkouts on `main` tracking
+`origin/main`. Existing installs can register the job once with
+`sb client-update schedule`. Run `sb client-update now` to check immediately.
+
+The schedule fetches only `origin/main`. It fast-forwards clean checkouts,
+refreshes and import-checks the CLI environment, and rolls back if refresh
+fails. It skips detached checkouts, explicit release pins, disabled clients,
+dirty worktrees and divergent history. The scheduled job runs as your user.
+If another `sb` command is using the checkout, the daily update skips that run.
+On macOS, update messages go to `runtime/sandbox-client-update-*.log`. On Linux,
+they go to the systemd user journal.
+The daily check updates only this checkout. It does not migrate servers.
+
+Use `sb client-update disable` to remove this checkout's schedule. To keep it
+off when running setup again, set `defaults.controller_auto_update: false` in
+the machine configuration. Archive installs and headless server setup do not
+register a schedule.
+
+## Updates learned from a server
+
 At the start of a remote-capable command, right after argument parsing and
 before the command does anything:
 
@@ -133,7 +154,7 @@ To stay quiet:
   for 15 minutes, and neither fetches nor prints again inside that window. A
   remote migrated from an unpublished feature branch is refused once.
 
-## Never updates
+## When the command hook skips updates
 
 - **Pinned controllers**: detached checkouts such as
   `.scratch/sandbox/controller-<sha>` get the notice only.

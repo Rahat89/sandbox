@@ -507,7 +507,7 @@ def _forwarded_cli_argv(argv, *, strict):
 
 
 @_config_parse_error_boundary
-def main(*, invocation_started_monotonic: float | None = None):
+def main(*, invocation_started_monotonic: float | None = None, release_checkout=None):
     if invocation_started_monotonic is None:
         invocation_started_monotonic = time.monotonic()
     p = argparse.ArgumentParser(
@@ -538,6 +538,9 @@ Per-project (each plugin carries its own sandbox.config.json):
              "accepted anywhere on the command line",
     )
     sub = p.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("client-update", help="update the Sandbox CLI from origin/main")
+    sp.add_argument("action", choices=("now", "schedule", "disable"), nargs="?", default="now")
 
     sp = sub.add_parser("setup", help="One-shot: boot, install WP, build MCP, wire Claude")
     sp.add_argument("--no-pick", action="store_true",
@@ -1743,6 +1746,12 @@ Per-project (each plugin carries its own sandbox.config.json):
     # newer published revision a remote reported, then re-run once.
     from sandbox.controller_update.hook import maybe_auto_update
     maybe_auto_update(args, sys.argv)
+
+    if args.cmd == "client-update":
+        from sandbox.controller_update.daily import run
+        if args.action == "now" and release_checkout is not None:
+            release_checkout()
+        raise SystemExit(run(args.action, ROOT))
 
     # Feedback storage is independent of machine config and must remain usable
     # when sandbox.local.yml itself needs recovery.

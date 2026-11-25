@@ -74,6 +74,11 @@ def cmd_uninstall(cfg, args) -> None:
                        capture_output=True, text=True)
 
     # 5. Remove the global `sb` command if it points at this install.
+    from sandbox.controller_update.daily import remove_schedule
+    try:
+        remove_schedule(ROOT)
+    except OSError as exc:
+        info(f"could not remove the client update schedule: {exc}")
     try:
         import types as _types
         cmd_global(cfg, _types.SimpleNamespace(remove=True))

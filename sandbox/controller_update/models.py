@@ -53,6 +53,7 @@ class SkipReason(enum.Enum):
     NOT_CLI = ("not_cli", False)
     NOT_REMOTE_COMMAND = ("not_remote_command", False)
     NO_HINT = ("no_hint", False)
+    UP_TO_DATE = ("up_to_date", False)
     NOT_GIT = ("not_git", False)
     MEMOIZED = ("memoized", False)
     DETACHED = ("detached", True)

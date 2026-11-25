@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Sandbox installer — run this once after cloning the alim-dev branch:
+# Sandbox installer. Run this once after cloning the repository:
 #
 #   git clone https://github.com/alimuzzaman/sandbox.git
 #   cd sandbox && ./install.sh
@@ -7,8 +7,8 @@
 # It walks you through setup step by step: makes sure python3 is present (the
 # only thing the CLI needs to start), then hands off to `./sb setup`, which
 # checks Docker, boots WordPress, builds the MCP server, wires Claude, and
-# offers to install anything else that's missing. Nothing is installed without
-# your "y", and the base install needs no sudo password.
+# offers to install missing dependencies. Setup enables daily client updates for
+# checkouts tracking origin/main. The update job runs without sudo.
 set -eu
 
 # --- pretty output (degrade gracefully if no color) -----------------------
